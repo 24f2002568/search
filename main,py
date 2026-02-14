@@ -1,0 +1,289 @@
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import numpy as np
+import openai
+from typing import List, Dict, Tuple
+import time
+from functools import lru_cache
+import os
+from dotenv import load_dotenv
+import json
+
+# Load environment variables
+load_dotenv()
+
+app = Flask(__name__)
+CORS(app)
+
+# Initialize OpenAI client
+openai.api_key = os.getenv('OPENAI_API_KEY')
+
+# Sample customer issues documents
+DOCUMENTS = [
+    {"id": i, "content": f"Customer issue document {i}", "metadata": {"source": "support_ticket"}}
+    for i in range(120)
+]
+
+# Add some realistic support ticket content
+support_tickets = [
+    {"id": 0, "content": "Unable to login to my account after password reset. Getting error 'Invalid credentials' even though I just changed my password.", "metadata": {"category": "authentication"}},
+    {"id": 1, "content": "Application crashes when I try to upload large files >100MB. Error message: 'Out of memory exception'.", "metadata": {"category": "performance"}},
+    {"id": 2, "content": "Payment processing failed multiple times. Customer reports card is charged but order not confirmed.", "metadata": {"category": "billing"}},
+    {"id": 3, "content": "Mobile app not syncing with web version. Changes made on mobile don't appear on web dashboard.", "metadata": {"category": "sync"}},
+    {"id": 4, "content": "Need help setting up two-factor authentication. Can't find the option in security settings.", "metadata": {"category": "security"}},
+    {"id": 5, "content": "API rate limiting too strict. Getting 429 errors when trying to process bulk operations.", "metadata": {"category": "api"}},
+    {"id": 6, "content": "Dashboard charts not loading properly. Shows blank graphs for some date ranges.", "metadata": {"category": "ui"}},
+    {"id": 7, "content": "Email notifications not being sent. Users not receiving password reset emails.", "metadata": {"category": "notifications"}},
+    {"id": 8, "content": "Export feature broken. CSV downloads but contains no data for filtered results.", "metadata": {"category": "data_export"}},
+    {"id": 9, "content": "Search functionality slow and inaccurate. Takes >5 seconds to return results.", "metadata": {"category": "search"}},
+    {"id": 10, "content": "Cannot delete user accounts. Getting foreign key constraint error.", "metadata": {"category": "user_management"}},
+    {"id": 11, "content": "Reports generation failing for large datasets. Times out after 30 seconds.", "metadata": {"category": "reporting"}},
+    {"id": 12, "content": "Mobile push notifications not working on iOS devices. Android works fine.", "metadata": {"category": "mobile"}},
+    {"id": 13, "content": "SSO integration issues with Azure AD. Users redirected to error page.", "metadata": {"category": "authentication"}},
+    {"id": 14, "content": "Data visualization tool showing incorrect totals in summary cards.", "metadata": {"category": "analytics"}},
+    {"id": 15, "content": "Cannot add new team members. Invitation emails never arrive.", "metadata": {"category": "team_management"}},
+    {"id": 16, "content": "Database connection pool exhausted during peak hours. Service unavailable errors.", "metadata": {"category": "infrastructure"}},
+    {"id": 17, "content": "File upload progress bar stuck at 99%. Upload completes but UI doesn't update.", "metadata": {"category": "ui"}},
+    {"id": 18, "content": "OAuth2 token expiration not handled gracefully. Users need to re-login every hour.", "metadata": {"category": "authentication"}},
+    {"id": 19, "content": "Search filters not applying correctly. Results include items outside selected criteria.", "metadata": {"category": "search"}},
+    {"id": 20, "content": "Bulk edit feature not saving changes. Operations succeed but data remains unchanged.", "metadata": {"category": "data_operations"}},
+    {"id": 21, "content": "Customer can't reset password. 'Reset password' link expired immediately after request.", "metadata": {"category": "authentication"}},
+    {"id": 22, "content": "API endpoint returning 500 errors intermittently. No pattern in failures.", "metadata": {"category": "api"}},
+    {"id": 23, "content": "Dashboard filters reset after page refresh. User preferences not saved.", "metadata": {"category": "ui"}},
+    {"id": 24, "content": "Mobile app crash on startup after latest update. App version 2.1.3.", "metadata": {"category": "mobile"}},
+    {"id": 25, "content": "Unable to connect to third-party integration. Webhook failing with SSL error.", "metadata": {"category": "integrations"}},
+    {"id": 26, "content": "Data import from CSV failing for certain file formats. UTF-8 encoded files work.", "metadata": {"category": "data_operations"}},
+    {"id": 27, "content": "User permissions not updating immediately. Changes take effect after 24 hours.", "metadata": {"category": "access_control"}},
+    {"id": 28, "content": "Search autocomplete showing irrelevant suggestions. Needs improvement.", "metadata": {"category": "search"}},
+    {"id": 29, "content": "Email templates not rendering correctly in Outlook. HTML formatting issues.", "metadata": {"category": "notifications"}},
+]
+
+# Extend to 120 documents by duplicating with variations
+for i in range(30, 120):
+    base_ticket = support_tickets[i % 30].copy()
+    base_ticket["id"] = i
+    base_ticket["content"] = base_ticket["content"] + f" (Variant {i//30})"
+    support_tickets.append(base_ticket)
+
+DOCUMENTS = support_tickets
+
+class SemanticSearch:
+    def __init__(self, documents: List[Dict]):
+        self.documents = documents
+        self.embeddings = None
+        self.embedding_dim = 1536  # text-embedding-3-small dimension
+        self._initialize_embeddings()
+    
+    def _get_embedding(self, text: str) -> List[float]:
+        """Get embedding for a single text"""
+        try:
+            response = openai.embeddings.create(
+                model="text-embedding-3-small",
+                input=text,
+                encoding_format="float"
+            )
+            return response.data[0].embedding
+        except Exception as e:
+            print(f"Error getting embedding: {e}")
+            # Return zero vector as fallback
+            return [0.0] * self.embedding_dim
+    
+    def _initialize_embeddings(self):
+        """Initialize embeddings for all documents"""
+        print("Initializing document embeddings...")
+        self.embeddings = []
+        for doc in self.documents:
+            embedding = self._get_embedding(doc["content"])
+            self.embeddings.append(embedding)
+        print(f"Initialized {len(self.embeddings)} embeddings")
+    
+    @lru_cache(maxsize=100)
+    def get_query_embedding(self, query: str) -> tuple:
+        """Get and cache query embedding"""
+        embedding = self._get_embedding(query)
+        return tuple(embedding)  # Convert to tuple for caching
+    
+    def cosine_similarity(self, a: List[float], b: List[float]) -> float:
+        """Compute cosine similarity between two vectors"""
+        a = np.array(a)
+        b = np.array(b)
+        
+        # Handle zero vectors
+        if np.linalg.norm(a) == 0 or np.linalg.norm(b) == 0:
+            return 0.0
+        
+        return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+    
+    def initial_retrieval(self, query: str, k: int = 7) -> List[Tuple[int, float, Dict]]:
+        """Retrieve top k documents using vector similarity"""
+        query_embedding = self.get_query_embedding(query)
+        
+        # Compute similarities
+        similarities = []
+        for i, doc_embedding in enumerate(self.embeddings):
+            similarity = self.cosine_similarity(query_embedding, doc_embedding)
+            similarities.append((i, similarity, self.documents[i]))
+        
+        # Sort by similarity descending and return top k
+        similarities.sort(key=lambda x: x[1], reverse=True)
+        
+        # Normalize scores to 0-1 range
+        if similarities and similarities[0][1] > 0:
+            max_sim = similarities[0][1]
+            normalized = [(idx, sim/max_sim, doc) for idx, sim, doc in similarities[:k]]
+        else:
+            normalized = [(idx, sim, doc) for idx, sim, doc in similarities[:k]]
+        
+        return normalized[:k]
+    
+    def rerank_with_llm(self, query: str, candidates: List[Tuple[int, float, Dict]]) -> List[Tuple[int, float, Dict]]:
+        """Re-rank candidates using GPT for relevance scoring"""
+        reranked_results = []
+        
+        for idx, initial_score, doc in candidates:
+            # Create prompt for relevance scoring
+            prompt = f"""Query: "{query}"
+Document: "{doc['content']}"
+
+Rate the relevance of this document to the query on a scale of 0-10.
+Consider:
+- How well the document addresses the query
+- Semantic similarity beyond keywords
+- Context and intent matching
+
+Respond with only the number (0-10)."""
+            
+            try:
+                response = openai.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content": "You are a relevance scorer. Output only a number between 0 and 10."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0,
+                    max_tokens=5
+                )
+                
+                # Extract score from response
+                score_text = response.choices[0].message.content.strip()
+                relevance_score = float(score_text) / 10.0  # Normalize to 0-1
+                
+            except Exception as e:
+                print(f"Error in LLM scoring: {e}")
+                relevance_score = initial_score  # Fallback to initial score
+            
+            reranked_results.append((idx, relevance_score, doc))
+        
+        # Sort by new relevance score
+        reranked_results.sort(key=lambda x: x[1], reverse=True)
+        return reranked_results
+
+# Initialize search engine
+search_engine = SemanticSearch(DOCUMENTS)
+
+@app.route('/search', methods=['POST'])
+def search():
+    """Main search endpoint"""
+    start_time = time.time()
+    
+    try:
+        data = request.get_json()
+        query = data.get('query', '')
+        k = min(data.get('k', 7), 20)  # Cap at 20
+        rerank = data.get('rerank', True)
+        rerank_k = min(data.get('rerankK', 4), k)  # Can't exceed initial k
+        
+        if not query:
+            return jsonify({
+                "error": "Query is required"
+            }), 400
+        
+        # Stage 1: Initial retrieval
+        retrieval_start = time.time()
+        candidates = search_engine.initial_retrieval(query, k)
+        retrieval_time = (time.time() - retrieval_start) * 1000  # Convert to ms
+        
+        # Stage 2: Re-ranking (if enabled)
+        rerank_time = 0
+        if rerank and candidates:
+            rerank_start = time.time()
+            candidates = search_engine.rerank_with_llm(query, candidates)
+            rerank_time = (time.time() - rerank_start) * 1000
+        
+        # Take top rerank_k results
+        final_results = candidates[:rerank_k]
+        
+        # Format results
+        results = []
+        for idx, score, doc in final_results:
+            # Ensure score is in 0-1 range
+            normalized_score = max(0.0, min(1.0, float(score)))
+            
+            results.append({
+                "id": doc["id"],
+                "score": round(normalized_score, 4),
+                "content": doc["content"],
+                "metadata": doc.get("metadata", {"source": "support_ticket"})
+            })
+        
+        # Handle edge cases
+        if not results:
+            # No results found
+            results.append({
+                "id": -1,
+                "score": 0.0,
+                "content": "No matching documents found",
+                "metadata": {"source": "system"}
+            })
+        
+        # Calculate total latency
+        total_latency = (time.time() - start_time) * 1000
+        
+        response = {
+            "results": results,
+            "reranked": rerank and len(candidates) > 0,
+            "metrics": {
+                "latency": round(total_latency, 2),
+                "retrieval_latency": round(retrieval_time, 2),
+                "rerank_latency": round(rerank_time, 2) if rerank else 0,
+                "totalDocs": len(DOCUMENTS),
+                "candidates_retrieved": len(candidates),
+                "final_results": len(results)
+            }
+        }
+        
+        return jsonify(response)
+    
+    except Exception as e:
+        print(f"Error in search endpoint: {e}")
+        return jsonify({
+            "error": str(e),
+            "results": [],
+            "reranked": False,
+            "metrics": {
+                "latency": round((time.time() - start_time) * 1000, 2),
+                "totalDocs": len(DOCUMENTS)
+            }
+        }), 500
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint"""
+    return jsonify({
+        "status": "healthy",
+        "documents_count": len(DOCUMENTS),
+        "embeddings_loaded": search_engine.embeddings is not None
+    })
+
+@app.route('/debug/embeddings', methods=['GET'])
+def debug_embeddings():
+    """Debug endpoint to check embedding status"""
+    return jsonify({
+        "documents_count": len(DOCUMENTS),
+        "embeddings_count": len(search_engine.embeddings) if search_engine.embeddings else 0,
+        "embedding_dim": search_engine.embedding_dim
+    })
+
+if __name__ == '__main__':
+    # Run the Flask app
+    app.run(host='0.0.0.0', port=5000, debug=True)
